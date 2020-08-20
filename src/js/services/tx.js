@@ -1,5 +1,4 @@
 import constants from "../services/constants"
-import BLOCKCHAIN_INFO from "../../../env"
 
 export default class Tx {
   constructor(
@@ -36,6 +35,11 @@ export default class Tx {
         newTx.gas = receipt.gasUsed
         newTx.blockNumber = receipt.blockNumber
         var logs = receipt.logs
+
+        if (!receipt.blockNumber) {
+          resolve(newTx)          
+          return
+        }
         if (newTx.type == "exchange") {
           if (logs.length == 0) {
             newTx.threw = true
@@ -44,8 +48,7 @@ export default class Tx {
           } else {
             var theLog
             for (var i = 0; i < logs.length; i++) {
-              if (logs[i].address.toLowerCase() == BLOCKCHAIN_INFO.network &&
-                logs[i].topics[0].toLowerCase() == BLOCKCHAIN_INFO.trade_topic) {
+              if (logs[i].topics[0].toLowerCase() == constants.TRADE_TOPIC.toLowerCase()) {
                 theLog = logs[i]
                 newTx.eventTrade = theLog.data
                 break
@@ -54,9 +57,29 @@ export default class Tx {
             newTx.status = theLog ? "success" : "failed"
             newTx.error = theLog ? "" : "transaction.error_tx_contract"
           }
-        } else {
-          newTx.status = "success"
         }
+        if (newTx.type === "transfer"){
+          if(newTx.data.tokenSymbol === "ETH") {
+            newTx.status = "success"
+          }else{
+            if (logs.length == 0) {
+              newTx.threw = true
+              newTx.status = "failed"
+              newTx.error = "transaction.error_tx_log"
+            } else {
+              var theLog
+              for (var i = 0; i < logs.length; i++) {
+                if (logs[i].topics[0].toLowerCase() == constants.TRANSFER_TOPIC.toLowerCase()) {
+                  theLog = logs[i]
+                  newTx.eventTrade = theLog.data
+                  break
+                }
+              }
+              newTx.status = theLog ? "success" : "failed"
+              newTx.error = theLog ? "" : "transaction.error_tx_contract"
+            }
+          }
+        }         
         resolve(newTx)
       }).catch(err => {
         reject(err)

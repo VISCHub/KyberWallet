@@ -1,21 +1,17 @@
-import { take, put, call, fork, select, takeEvery, all, cancel } from 'redux-saga/effects'
-import { delay } from 'redux-saga'
+import { take, put, call, fork, takeEvery, cancel } from 'redux-saga/effects'
 import * as actions from '../actions/accountActions'
-import { clearSession, setGasPrice, setBalanceToken } from "../actions/globalActions"
-import { openInfoModal } from '../actions/utilActions'
-
-import { goToRoute, updateAllRate, updateAllRateComplete } from "../actions/globalActions"
-import { randomToken, setRandomExchangeSelectedToken, setCapExchange } from "../actions/exchangeActions"
-import { setRandomTransferSelectedToken } from "../actions/transferActions"
-//import { randomForExchange } from "../utils/random"
-
+import * as globalActions from '../actions/globalActions'
+import { clearSession, setGasPrice, setBalanceToken, closeChangeWallet } from "../actions/globalActions"
+import { getPendingBalancesComplete } from "../actions/limitOrderActions"
+import * as utilActions from '../actions/utilActions'
+import * as common from "./common"
 import * as service from "../services/accounts"
 import constants from "../services/constants"
-import { Rate, updateAllRatePromise } from "../services/rate"
-
-import { findNetworkName } from "../utils/converter"
-
+import { convertToETHBalance, findNetworkName, sumOfTwoNumber } from "../utils/converter"
 import { getTranslate } from 'react-localize-redux'
+import { store } from '../store';
+import { getWallet } from "../services/keys"
+import { sortBy } from "underscore";
 
 export function* updateAccount(action) {
   const { account, ethereum } = action.payload
@@ -25,83 +21,136 @@ export function* updateAccount(action) {
   } catch (err) {
     console.log(err)
   }
-
 }
 
 export function* updateTokenBalance(action) {
   try {
-    const { ethereum, address, tokens } = action.payload
-    const balanceTokens = yield call([ethereum, ethereum.call], "getAllBalancesTokenAtLatestBlock", address, tokens)
+    const { ethereum, address, tokens } = action.payload;
+    const latestBlock = yield call([ethereum, ethereum.call], "getLatestBlock");
+    const balanceTokens = yield call([ethereum, ethereum.call], "getAllBalancesTokenAtSpecificBlock", address, tokens, latestBlock)
+    const limitOrder = store.getState().limitOrder;
+    
+    yield call(processLimitOrderPendingBalance, ethereum, limitOrder.pendingBalances, limitOrder.pendingTxs, latestBlock);
     yield put(setBalanceToken(balanceTokens))
   }
   catch (err) {
     console.log(err)
+  }
+}
+
+function* processLimitOrderPendingBalance(ethereum, pendingBalances, pendingTxs, latestBlock) {
+  if (ethereum && pendingTxs.length <= 3) {
+    let isModified = false;
+
+    for (var i = 0; i < pendingTxs.length; i++) {
+      if (pendingTxs.status === 1) continue;
+
+      const isTxMined = yield call(common.checkTxMined, ethereum, pendingTxs[i].tx_hash, latestBlock, constants.LIMIT_ORDER_TOPIC);
+      if (isTxMined) {
+        pendingTxs[i].status = 1;
+        isModified = true;
+      }
+    }
+
+    if (isModified) {
+      yield put(getPendingBalancesComplete(pendingBalances, pendingTxs));
+    }
+  }
+}
+
+function* createNewAccount(address, type, keystring, ethereum, walletType, info){
+  try{
+    const account = yield call(service.newAccountInstance, address, type, keystring, ethereum, walletType, info)
+    return {status: "success", data: account}
+  }catch(e){
+    console.log(e)
+    return {status: "fail"}
   }
 }
 
 export function* importNewAccount(action) {
   yield put(actions.importLoading())
-  const { address, type, keystring, ethereum, tokens, metamask } = action.payload
+  let { address, type, keystring, ethereum, walletType, walletName, info, wallet } = action.payload;
+  const state = store.getState();
+  const global = state.global;
+  const tokens = state.tokens.tokens;
+  const translate = getTranslate(state.locale);
+  
   try {
-    const account = yield call(service.newAccountInstance, address, type, keystring, ethereum)
-    yield put(actions.closeImportLoading())
-    yield put(actions.importNewAccountComplete(account))
-    yield put(goToRoute('/exchange'))
+    let account;
+    const accountRequest = yield call(createNewAccount, address, type, keystring, ethereum, walletType, info);
 
-    var maxCapOneExchange = yield call([ethereum, ethereum.call], "getMaxCapAtLatestBlock", address)
-    yield put(setCapExchange(maxCapOneExchange))
-    //update token and token balance
-    var newTokens = {}
-    Object.values(tokens).map(token => {
-      var token = { ...token }
-      newTokens[token.symbol] = token
-    })
-    // var randomToken = [
-    //   {
-    //     address: newTokens['ETH'].address,
-    //     symbol: newTokens['ETH'].symbol
-    //   },
-    //   {
-    //     address: newTokens['KNC'].address,
-    //     symbol: newTokens['KNC'].symbol
-    //   },
-    // ]
-    // yield put(setRandomExchangeSelectedToken(randomToken))
+    if (accountRequest.status === "timeout") {
+      yield put(actions.closeImportLoading())
+      yield put(utilActions.openInfoModal(
+        translate("error.error_occurred") || "Error occurred",
+        translate("error.node_error") || "There are some problems with nodes. Please try again in a while.")
+      );
+      return
+    }
     
-    //todo set random token for exchange
+    if (accountRequest.status === "fail") {
+      yield put(actions.closeImportLoading())
+      yield put(utilActions.openInfoModal(
+        translate("error.error_occurred") || "Error occurred",
+        translate("error.network_error") || "Cannot connect to node right now. Please check your network!")
+      );
+      return
+    }
+
+    if (accountRequest.status === "success") {
+      account = accountRequest.data
+    }
+
+    yield put(setGasPrice());
+    yield put(actions.closeImportLoading());
+
+    if (wallet === null) {
+      wallet = getWallet(account.type);
+    }
+
+    yield put(actions.importNewAccountComplete(account, wallet, walletName));
+    yield put(globalActions.checkUserEligible(ethereum));
+
+    if (global.isChangingWallet) yield put(closeChangeWallet());
+
+    global.analytics.callTrack("loginWallet", type);
     
+    let supportedTokens = [];
+    Object.keys(tokens).forEach((key) => {
+      supportedTokens.push(tokens[key])
+    });
+    const balanceTokens = yield call([ethereum, ethereum.call], "getAllBalancesTokenAtLatestBlock", address, supportedTokens);
+    let mapBalance = {};
 
-    yield call(ethereum.fetchRateExchange)
-
-    const balanceTokens = yield call([ethereum, ethereum.call], "getAllBalancesTokenAtLatestBlock", address, tokens)
-    //map balance
-    var mapBalance = {}
     balanceTokens.map(token => {
       mapBalance[token.symbol] = token.balance
-    })
-    yield put(setBalanceToken(balanceTokens))
+    });
+
+    yield put(setBalanceToken(balanceTokens));
+
+    if (window.kyberBus) { window.kyberBus.broadcast('wallet.import', address) }
+    
+    if (wallet.getDisconnected){
+      const subcribeClearSessionTask = yield fork(subcribeWalletDisconnect, wallet);
+      yield take('GLOBAL.CLEAR_SESSION');
+      yield cancel(subcribeClearSessionTask);
+    }
   }
   catch (err) {
     console.log(err)
-    yield put(actions.throwError('Cannot connet to blockchain right now. Please try again later.'))
+    yield put(actions.throwError(translate("error.network_error") || "Cannot connect to node right now. Please check your network!"))
     yield put(actions.closeImportLoading())
-  }
-
-
-
-
-  //fork for metamask
-  if (type === "metamask") {
-    const { web3Service, address, networkId } = { ...metamask }
-    const watchCoinbaseTask = yield fork(watchCoinbase, web3Service, address, networkId)
-
-    yield take('GLOBAL.CLEAR_SESSION')
-    yield cancel(watchCoinbaseTask)
   }
 }
 
+function* subcribeWalletDisconnect(wallet){  
+  yield call([wallet, wallet.getDisconnected])  
+  yield put(clearSession())
+}
+
 export function* importMetamask(action) {
-  const { web3Service, networkId, ethereum, tokens, translate } = action.payload
+  const { web3Service, networkId, ethereum, translate, walletType } = action.payload
   try {
     const currentId = yield call([web3Service, web3Service.getNetworkId])
     if (parseInt(currentId, 10) !== networkId) {
@@ -109,54 +158,66 @@ export function* importMetamask(action) {
       var expectedName = findNetworkName(networkId)
       if (currentName) {
         yield put(actions.throwError(translate("error.network_not_match", { currentName: currentName, expectedName: expectedName }) || "Network is not match"))
+        if (walletType !== null && walletType !== "metamask"){
+          let title = translate("error.error_occurred") || "Error occurred"
+          let content = translate("error.network_not_match", { currentName: currentName, expectedName: expectedName }) || "Network is not match"
+          yield put(utilActions.openInfoModal(title, content))
+        }
         return
       } else {
         yield put(actions.throwError(translate("error.network_not_match_unknow", { expectedName: expectedName }) || "Network is not match"))
+        if (walletType !== null && walletType !== "metamask"){
+          let title = translate("error.error_occurred") || "Error occurred"
+          let content = translate("error.network_not_match_unknow", { expectedName: expectedName }) || "Network is not match"
+          yield put(utilActions.openInfoModal(title, content))
+        }
         return
       }
     }
-    //get coinbase
-    const address = yield call([web3Service, web3Service.getCoinbase])
+
+    const address = yield call([web3Service, web3Service.getCoinbase], true)
     yield call([web3Service, web3Service.setDefaultAddress, address])
 
     const metamask = { web3Service, address, networkId }
     yield put(actions.importNewAccount(
       address,
       "metamask",
-      web3Service,
+      web3Service.getWalletId(),
       ethereum,
-      tokens,
-      metamask
+      walletType,
+      metamask,
+      "Metamask"
     ))
   } catch (e) {
     console.log(e)
-    yield put(actions.throwError(translate("error.cannot_connect_metamask") || "Cannot get metamask account"))
+    yield put(actions.throwError(translate("error.cannot_connect_metamask") || "Cannot get metamask account. You probably did not login in Metamask"))
+    if (walletType !== null && walletType !== "metamask"){
+      let title = translate("error.error_occurred") || "Error occurred"
+      let content = translate("error.cannot_connect_metamask") || "Cannot get metamask account. You probably did not login in Metamask"
+      yield put(utilActions.openInfoModal(title, content))
+    }
   }
 }
 
+export function* setBalanceTokenComplete() {
+  const state = store.getState();
+  const tokens = state.tokens.tokens;
 
-function* watchCoinbase(web3Service, address, networkId) {
-  while (true) {
-    try {
-      yield call(delay, 500)
-      const coinbase = yield call([web3Service, web3Service.getCoinbase])
-      if (coinbase !== address) {
-        yield put(clearSession())
-        return
-      }
-      const currentId = yield call([web3Service, web3Service.getNetworkId])
-      if (parseInt(currentId, 10) !== networkId) {
-        console.log(currentId)
-        yield put(clearSession())
-        return
-      }
-      //check 
-    } catch (error) {
-      console.log(error)
-      yield put(clearSession())
-      return;
-    }
-  }
+  let availableTokens = Object.keys(tokens).filter((symbol) => {
+    return tokens[symbol].balance != 0;
+  }).map(function(symbol) {
+    const token = tokens[symbol];
+    token.balanceInETH = convertToETHBalance(token.balance, token.decimals, token.symbol, token.rate)
+    return token;
+  });
+
+  const totalBalanceInETH = availableTokens.reduce((total, token) => {
+    return +sumOfTwoNumber(total, token.balanceInETH);
+  }, 0);
+
+  availableTokens = sortBy(availableTokens, (token) => -token.balanceInETH);
+
+  yield put(actions.setTotalBalanceAndAvailableTokens(totalBalanceInETH, availableTokens));
 }
 
 export function* watchAccount() {
@@ -164,5 +225,5 @@ export function* watchAccount() {
   yield takeEvery("ACCOUNT.IMPORT_NEW_ACCOUNT_PENDING", importNewAccount)
   yield takeEvery("ACCOUNT.IMPORT_ACCOUNT_METAMASK", importMetamask)
   yield takeEvery("ACCOUNT.UPDATE_TOKEN_BALANCE", updateTokenBalance)
-
+  yield takeEvery("GLOBAL.SET_BALANCE_TOKEN", setBalanceTokenComplete)
 }
